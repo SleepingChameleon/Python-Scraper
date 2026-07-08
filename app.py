@@ -68,24 +68,141 @@ def pdf_to_excel(pdf_path: str, out_path: str) -> dict:
     return {"tables": len(all_tables), "output": out_path}
 
 
+def normalize_to_price_schema(records: list[dict]) -> list[dict]:
+    """
+    Normalize raw row dicts into the unified price schema:
+      last_updated | item_name | [extra fields] | retail_price | srp | selling_price | location
+
+    - Price columns are detected by keyword matching and mapped to the 3 price slots.
+    - date/updated columns map to last_updated.
+    - location columns map to location.
+    - Everything else that isn't item_name becomes an extra field (union across all rows).
+    - Missing fields default to None.
+    """
+    import re
+
+    PRICE_KEYWORDS   = {
+        "retail_price":   ["retail price", "retailprice", "retail"],
+        "srp":            ["srp", "suggested retail", "recommended price"],
+        "selling_price":  ["selling price", "sellingprice", "sale price", "benta"],
+    }
+    DATE_KEYWORDS     = ["date", "updated", "as of", "petsa", "last updated"]
+    ITEM_KEYWORDS     = ["item", "commodity", "product", "name", "description",
+                         "goods", "pangalan", "produkto"]
+    LOCATION_KEYWORDS = ["location", "place", "market", "area", "lugar", "city", "province"]
+
+    def match(col: str, keywords: list[str]) -> bool:
+        col_l = col.lower().strip()
+        return any(k in col_l for k in keywords)
+
+    def classify(col: str):
+        # price slots checked first with longer/more specific keywords to avoid
+        # "Market" matching selling_price
+        for slot, kws in PRICE_KEYWORDS.items():
+            if match(col, kws):
+                return slot
+        if match(col, DATE_KEYWORDS):     return "last_updated"
+        if match(col, ITEM_KEYWORDS):     return "item_name"
+        if match(col, LOCATION_KEYWORDS): return "location"
+        # fallback: bare "price" or "halaga" without a modifier → retail_price
+        if re.search(r'\bprice\b|\bpresyo\b|\bhalaga\b', col.lower()):
+            return "retail_price"
+        return "extra"
+
+    if not records:
+        return []
+
+    all_cols = list(dict.fromkeys(k for row in records for k in row))
+
+    # build column → schema_slot mapping
+    col_map: dict[str, str] = {}
+    price_slots_used: dict[str, str] = {}   # slot → first col mapped to it
+
+    for col in all_cols:
+        slot = classify(col)
+        if slot in ("retail_price", "srp", "selling_price"):
+            if slot not in price_slots_used:
+                price_slots_used[slot] = col
+                col_map[col] = slot
+            else:
+                # already mapped — treat as extra
+                col_map[col] = f"extra::{col}"
+        else:
+            col_map[col] = slot
+
+    # collect extra field names (preserving order, union across rows)
+    extra_cols = [c for c in all_cols if col_map[c] in ("extra", f"extra::{c}") or col_map[c].startswith("extra::")]
+    # de-dupe extras cleanly
+    seen_extra = []
+    for c in all_cols:
+        s = col_map[c]
+        if s == "extra" or s.startswith("extra::"):
+            label = c if s == "extra" else c
+            if label not in seen_extra:
+                seen_extra.append(label)
+
+    def clean_val(v):
+        if v is None or (isinstance(v, str) and v.strip() == ""):
+            return None
+        if isinstance(v, str):
+            v = v.strip()
+        return v
+
+    normalized = []
+    for row in records:
+        out: dict = {
+            "last_updated":  None,
+            "item_name":     None,
+        }
+        # extras (union, in order)
+        for ec in seen_extra:
+            out[ec] = None
+        out["retail_price"]  = None
+        out["srp"]           = None
+        out["selling_price"] = None
+        out["location"]      = None
+
+        for col, val in row.items():
+            slot = col_map.get(col, "extra")
+            cv   = clean_val(val)
+            if slot in out:
+                if out[slot] is None:          # first write wins
+                    out[slot] = cv
+            elif slot.startswith("extra::"):
+                label = col
+                if label in out:
+                    out[label] = cv
+            else:
+                # bare "extra" — col name is the key
+                if col in out:
+                    out[col] = cv
+
+        normalized.append(out)
+
+    return normalized
+
+
 def excel_to_json(xlsx_path: str, out_path: str) -> dict:
-    xl     = pd.ExcelFile(xlsx_path)
-    result = {}
+    xl      = pd.ExcelFile(xlsx_path)
+    all_rows: list[dict] = []
 
     for sheet in xl.sheet_names:
         df = xl.parse(sheet)
         df = df.where(pd.notnull(df), None)
-        result[sheet] = json.loads(df.to_json(orient="records", date_format="iso"))
+        rows = json.loads(df.to_json(orient="records", date_format="iso"))
+        all_rows.extend(rows)
 
+    normalized = normalize_to_price_schema(all_rows)
+
+    result_data = {"items": normalized}
     with open(out_path, "w", encoding="utf-8") as f:
-        json.dump(result, f, indent=2, ensure_ascii=False)
+        json.dump(result_data, f, indent=2, ensure_ascii=False)
 
-    total_rows = sum(len(v) for v in result.values())
-    return {"sheets": len(result), "rows": total_rows, "output": out_path}
+    return {"sheets": len(xl.sheet_names), "rows": len(normalized), "output": out_path}
 
 
 def image_to_json(image_path: str, out_path: str, psm: int = 6) -> dict:
-    """Use Tesseract OCR + heuristics to extract table data from an image as JSON."""
+    """Use Tesseract OCR to extract a price table from an image, then normalize schema."""
     try:
         # pyrefly: ignore [missing-import]
         import pytesseract
@@ -98,55 +215,46 @@ def image_to_json(image_path: str, out_path: str, psm: int = 6) -> dict:
         )
 
     img = Image.open(image_path)
-
-    # upscale small images for better OCR accuracy
     w, h = img.size
     if w < 1000:
         scale = 1000 / w
         img = img.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
 
-    # get structured TSV data from Tesseract (includes bounding box + confidence)
     tsv = pytesseract.image_to_data(img, config=f"--psm {psm}",
                                     output_type=pytesseract.Output.DICT)
 
-    # group words into rows by their top-coordinate (with tolerance)
-    words_by_row: dict[int, list[str]] = {}
-    n = len(tsv["text"])
-    for i in range(n):
+    words_by_row: dict[int, list] = {}
+    for i in range(len(tsv["text"])):
         conf = int(tsv["conf"][i])
         text = tsv["text"][i].strip()
         if conf < 30 or not text:
             continue
-        top = tsv["top"][i]
-        # bucket into rows with ±10px tolerance
-        bucket = round(top / 10) * 10
+        bucket = round(tsv["top"][i] / 10) * 10
         words_by_row.setdefault(bucket, []).append((tsv["left"][i], text))
 
-    # sort rows by vertical position, words within a row by horizontal position
     rows_sorted = []
     for bucket in sorted(words_by_row):
-        cells = [text for _, text in sorted(words_by_row[bucket])]
+        cells = [t for _, t in sorted(words_by_row[bucket])]
         if cells:
             rows_sorted.append(cells)
 
     if not rows_sorted:
         raise ValueError("No text detected in image. Try a clearer or higher-resolution photo.")
 
-    # first row = headers, rest = data
     headers = rows_sorted[0]
-    records = []
+    raw_records = []
     for row in rows_sorted[1:]:
-        # pad/trim row to match header length
         padded = row + [""] * (len(headers) - len(row))
         padded = padded[:len(headers)]
-        records.append(dict(zip(headers, padded)))
+        raw_records.append(dict(zip(headers, padded)))
 
-    result_data = {"table": records}
+    normalized   = normalize_to_price_schema(raw_records)
+    result_data  = {"items": normalized}
 
     with open(out_path, "w", encoding="utf-8") as f:
         json.dump(result_data, f, indent=2, ensure_ascii=False)
 
-    return {"tables": 1, "rows": len(records), "output": out_path, "data": result_data}
+    return {"tables": 1, "rows": len(normalized), "output": out_path, "data": result_data}
 
 
 # ── Reusable widgets ───────────────────────────────────────────────────────────
@@ -475,13 +583,13 @@ class ExcelToJsonPanel(tk.Frame):
             SUCCESS)
         self.log.log(
             f"✔  JSON saved: {result['output']}  |  "
-            f"{result['sheets']} sheet(s), {result['rows']} rows", "ok")
+            f"{result['sheets']} sheet(s), {result['rows']} rows  ·  unified price schema applied", "ok")
 
         with open(result["output"], encoding="utf-8") as f:
             full = json.load(f)
 
         n = self.preview_var.get()
-        preview = {sheet: rows[:n] for sheet, rows in full.items()}
+        preview = {"items": full["items"][:n]}
         self._json_str = json.dumps(full, indent=2, ensure_ascii=False)
         self._render_json(json.dumps(preview, indent=2, ensure_ascii=False))
 
